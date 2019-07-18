@@ -25,7 +25,7 @@ Motivation
 Quoting an expression ``[| e |]`` yields its representation. In the current
 implementation the type of representations is ``Q Exp``. This proposal is
 changing the type of the representation to the polymorphic
-``Quote m => m Exp``.
+``Quote m => m Exp``, and likewise ``Quote m => m (TExp a)``.
 The ``Quote`` interface defines the operations which are necessary to construct
 the code representation::
 
@@ -44,7 +44,7 @@ implementation is a name generation effect.
 Detaching quotations from ``Q`` makes way for a form of "pure" template haskell
 so there is no need to invoke ``Q`` in order to create the representation of an
 expression. The most immediate application is the ability to purely
-manipulate ``Exp`` values in user libraries.
+manipulate ``Exp`` and ``TExp a`` values in user libraries.
 
 Another benefit is that in a cross compilation setting a "pure" quote can be
 fully evaluated on the host and then the generated code compiled for the target.
@@ -61,8 +61,8 @@ Proposed Change Specification
 -----------------------------
 
 The goal of the changes is for an expression ``e : T`` to give the
-representation ``[| e |] : Quote m => m Exp``. Several steps are necessary to
-make this change possible.
+representation ``[| e |] : Quote m => m Exp`` and ``[|| e ||] : Quote m => m (TExp a)``.
+Several steps are necessary to make this change possible.
 
 1. Define the interface for ``Quote``::
 
@@ -84,6 +84,7 @@ make this change possible.
 
       class Lift a where
          lift :: Quote m => a -> m Exp
+         liftT :: Quote m => a -> m (TExp a)
 
    This is necessary so that implicit lifting can continue to work without
    enforcing strong constraints on the type of the bracket.
@@ -97,16 +98,28 @@ make this change possible.
       f :: (Quote m, C m) => m Exp
       f = [| 5 | ]
 
+      -- Likewise for typed TH
+      ft :: (Quote m, C m) => m (TExp Int)
+      ft = [| 5 | ]
+
       -- f is used in a nested splice so the constraint on f, namely C, is propagated
       -- to a constraint on the whole representation.
       g :: (Quote m, C m) => m Exp
       g = [| $f + $f |]
 
-   A top-level splice still requires its argument to be of type ``Q Exp``.
+      -- Likewise for typed TH
+      gt :: (Quote m, C m) => m (TExp Int)
+      gt = [| $$ft + $$ft |]
+
+   A top-level splice still requires its argument to be of type ``Q Exp``,
+   and top-evel typed splice likewise ``Q (TExp a)``.
    So then splicing in ``g`` will cause ``m`` to be instantiated to ``Q``::
 
     h :: Int
     h = $(g) -- m ~ Q
+
+    ht :: Int
+    ht = $$(gt) -- m ~ Q
 
 5. The types of type, pattern and declaration quotes will also
    be generalised in the same manner.
@@ -159,8 +172,12 @@ expressions in splices. Each nested splice could have different constraints::
       g :: MonadIO m => m Exp
       [| putStrLn $(f) >> putStrLn $(g) |] :: (Applicative m, Quasi m, MonadIO m) => m Exp
 
-If one of the nested splices has a specific type, for instance ``Q Exp``, then
-the type of the whole expression is fixed to be ``Q Exp``.
+      ft :: Quasi m => m (TExp a)
+      gt :: MonadIO m => m (TExp a)
+      [| putStrLn $(f) >> putStrLn $(g) |] :: (Applicative m, Quasi m, MonadIO m) => m (TExp a)
+
+If one of the nested splices has a specific type, for instance ``Q Exp``/``Q (TExp Int)``, then
+the type of the whole expression is fixed to be ``Q Exp``/``Q (TExp Int)``.
 
 
 Costs and Drawbacks
