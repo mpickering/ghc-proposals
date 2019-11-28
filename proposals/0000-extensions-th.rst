@@ -51,27 +51,40 @@ The user-facing side of this change would involve the addition of one new constr
 
     data Exp -- Expressions
       = ...
-      | WithExtsE [OnOff Extension] Exp
+      | WithExtsE [Extension] Exp
 
     data Type -- Types
       = ...
-      | WithExtsT [OnOff Extension] Type
+      | WithExtsT [Extension] Type
 
     data Pat -- Patterns
       = ...
-      | WithExtsP [OnOff Extension] Pat
+      | WithExtsP [Extension] Pat
 
     data Dec -- Declarations
       = ...
-      | WithExtsD [OnOff Extension] [Dec]
+      | WithExtsD [Extension] [Dec]
 
-Here, the ``Extension`` type, which comes from ``GHC.LanguageExtensions``, is an enumeration of all of GHC's language extensions. The ``OnOff`` data type (which currently lives internally in the GHC API, but would be exposed publicly with this proposal) is defined as: ::
+Here, the ``Extension`` type, which comes from ``GHC.LanguageExtensions``, is an enumeration of all of GHC's language extensions.
+When the code contained within a ``WithExts*`` constructor is typechecked, the
+set of enabled extensions is set to the list of extensions specified by
+the constructor. The intent is to replicate the environment that was used
+when typechecking the quote in the first place. Therefore, a quote is implicitly
+wrapped in a ``WithExt*`` constructor to specify the environment the syntax
+should be interpreted in::
 
-    data OnOff a
-      = On a
-      | Off a
+    {-# LANGUAGE FlexibleContexts #-}
 
-Where the ``On`` constructor is interpreted to mean "please enable this locally", and the ``Off`` constructor is interpreted to mean "please disable this locally".
+    foo = [| 5 |]
+        => WithExtsD [FlexibleContexts] (Num 5)
+
+Because you have to specify all the extensions when using ``WithExts*`` it is
+also useful to add a new function to the ``Q`` monad to reify the currently
+enable extensions in the module where the quote is being compiled. Note however
+that the reification action will act at the point where the top-level splice
+is executated rather than in the defining module::
+
+    qReifyExtensions :: Q [Extension]
 
 One might ask why this proposal only adds ``WithExts*`` forms for ``Exp``, ``Type``, ``Pat``, and ``Dec``, and not other AST forms. The primary reason is that these are the four varities of AST forms that can be quoted in Template Haskell (through the ``[e| ... |]``, ``[t| ... |]``, ``[p| ... |]``, and ``[d| ... |]`` forms, respectively) and spliced (through ``$(...)``), so ``WithExts*`` is most likely to be useful in these scenarios. Of course, one could conceivably have ``WithExts*`` constructors for other AST forms—see the "Unresolved questions" section for further discussion.
 
@@ -79,7 +92,9 @@ Here is an example of how ``WithExtsD`` might be used: ::
 
     {-# LANGUAGE TemplateHaskell #-}
 
-    $(pure [ WithExtsD [On GADTs, On KindSignatures]
+    $(do
+        exts <- qReifyExtensions
+        pure [ WithExtsD (exts ++ [GADTs, KindSignatures])
                [d| data Foo :: * -> * where
                      MkFoo :: a -> Foo a |]
            ])
@@ -116,22 +131,16 @@ Note that I put an asterisk* after "parsing" because while there are some extens
 
 This is because GHC must first parse all of the source code first (including the bits within ``[d| ... |]``) before it can process the Template Haskell splice, so we are powerless to affect parsing with this technique. Nevertheless, I don't envision this being a huge problem in practice, since it's quite easy to work around the issue by writing an explicit TH AST instead of a quote, and language extensions that affect renaming/typechecking/desugaring far outnumber those that affect parsing.
 
-Note that the ``[OnOff Extension]`` lists have a left-to-right semantics. That is, in the following code: ::
-
-    {-# LANGUAGE TemplateHaskell #-}
-
-    $(pure [ WithExtsD [Off DataKinds, On DataKinds]
-               [d| f :: Proxy True
-                   f = Proxy ]
-           ])
-
-Within the ``[d| ... |]`` quote, GHC will have ``DataKinds`` enabled. That is because before GHC performs any compiler pass over a ``WithExts*`` constructor, it first processes the language extensions from left to right, toggling each one it sees. So before renaming ``f``, GHC will locally disable ``DataKinds`` (due to ``Off DataKinds``) and then immediately enable ``DataKinds`` (due to ``On DataKinds``). If the language extensions had been given in the reverse order (``[On DataKinds, Off DataKinds]``), then GHC would have rejected the program, as the last thing GHC would do before renaming ``f`` is disable ``DataKinds``, which is needed for the ``Proxy True`` type.
-
 Effect and Interactions
 -----------------------
 For the most part, this change would be orthogonal to other GHC features, as the internal changes are relegated to extra AST constructors which, aside from their ability to toggle language extensions, have no additional semantics, so there shouldn't be too many surprises in that department. Moreover, one has to opt in to using this feature with Template Haskell, so most Haskell programs should be unaffected by this.
 
 There is something of an open question about how each language extension should behave on a "local" basis. For extensions like ``DataKinds``, it's not so difficult to imagine how they would behave locally, as ``DataKinds`` operates on a per-promoted-type basis. For extensions like ``Safe`` or ``Trustworthy``, this is perhaps less clear (see the "Unresolved questions" section for more details).
+
+Implicitly wrapping all quotes in their context can lead to code bloat if you
+use a lot of quotes. Therefore it would be better to define a special
+top-level variable when records the extensions enabled in a specific module and
+to reuse the same list of extensions for each quotation.
 
 Costs and Drawbacks
 -------------------
@@ -139,6 +148,11 @@ This would be a rather heavy change to GHC's source ASTs, as we'd need a new con
 
 Alternatives
 ------------
+
+A previous version of this proposal suggesting using ``[OnOff Extension]`` rather than ``[Extension]`` which would toggle
+extensions on and off rather than completely setting the environment. However, this is not compositional as when composing
+code fragments an inner fragment may not typecheck with a certain extension enable in the outer context.
+
 Instead of modifying ASTs to accomplish this, one could imagine adding a new class method to ``Quasi``: ::
 
    class Quasi q where
@@ -148,6 +162,11 @@ Instead of modifying ASTs to accomplish this, one could imagine adding a new cla
 Where ``qWithExts exts q`` indicates that when ``q`` is renamed, typechecked, and desugared (post-splicing), the extensions in ``exts`` will be toggled. If this were possible, it would be a far more flexible solution, since we wouldn't need to change ASTs at all (and indeed, this would be applicable to *any* computation which lives in ``Quasi``, and not just expressions, types, patterns, and declarations). However, I have not been successful in implementing such an idea, and I am doubtful that the staging of it all even makes this idea feasible.
 
 One of the problems that this is addressing (being able to toggle language extensions at a finer granularity) would almost certainly be better addressed by a solution outside of Template Haskell, which comes with its own set of downsides. But no one seems to have a particular (non-TH) syntax in mind in `the discussion in Trac #602 <https://ghc.haskell.org/trac/ghc/ticket/602>`_, so until that time comes, I believe we should have *some* kind of solution, and this happens to be one.
+
+An alternative is to use a representation from after the end of typechecking,
+for example, core expressions. This would side-step the issue entirely for typed
+quotations as no further checking of extensions would need to take place
+after splicing.
 
 Unresolved questions
 --------------------
@@ -165,4 +184,4 @@ Does every language extension have a "local" semantics? For example, the ``Safe`
 
 Implementation Plan
 -------------------
-I volunteer to implement. I currently have a prototype implementation of these ideas `here <https://github.com/RyanGlScott/ghc/commit/2db8e9423e7f5b930922ba5f0261b44dab32a240>`_. This prototype only contains ``WithExtsE`` (for expressions) at the moment, but I imagine the amount of effort needed to add ``WithExtsT`` and ``WithExtsP`` (for types and patterns, respectively) would be similar. (Adding ``WithExtsD`` would be slightly more involved since GHC awkwardly represents top-level declarations in the source AST, but I believe that this difficulty could be overcome with enough elbow grease.)
+We volunteer to implement. Ryan Scott currently has a prototype implementation of these ideas `here <https://github.com/RyanGlScott/ghc/commit/2db8e9423e7f5b930922ba5f0261b44dab32a240>`_. This prototype only contains ``WithExtsE`` (for expressions) at the moment, but I imagine the amount of effort needed to add ``WithExtsT`` and ``WithExtsP`` (for types and patterns, respectively) would be similar. (Adding ``WithExtsD`` would be slightly more involved since GHC awkwardly represents top-level declarations in the source AST, but I believe that this difficulty could be overcome with enough elbow grease.)
